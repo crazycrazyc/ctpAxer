@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package ctp;
+
+// 合约信息消息
+message InstrumentMessage {
+    // 合约代码
+    string instrument_id = 1;
+    // 交易所代码
+    string exchange_id = 2;
+    // 合约名称
+    string instrument_name = 3;
+    // 合约在交易所的代码
+    string exchange_inst_id = 4;
+    // 产品代码
+    string product_id = 5;
+    // 产品类型
+    string product_class = 6;
+    // 交割年份
+    int32 delivery_year = 7;
+    // 交割月
+    int32 delivery_month = 8;
+    // 市价单最大下单量
+    int32 max_market_order_volume = 9;
+    // 市价单最小下单量
+    int32 min_market_order_volume = 10;
+    // 限价单最大下单量
+    int32 max_limit_order_volume = 11;
+    // 限价单最小下单量
+    int32 min_limit_order_volume = 12;
+    // 合约数量乘数
+    int32 volume_multiple = 13;
+    // 最小变动价位
+    double price_tick = 14;
+    // 创建日
+    string create_date = 15;
+    // 上市日
+    string open_date = 16;
+    // 到期日
+    string expire_date = 17;
+    // 开始交割日
+    string start_deliv_date = 18;
+    // 结束交割日
+    string end_deliv_date = 19;
+    // 合约生命周期状态
+    string inst_life_phase = 20;
+    // 当前是否交易
+    int32 is_trading = 21;
+    // 持仓类型
+    string position_type = 22;
+    // 持仓日期类型
+    string position_date_type = 23;
+    // 多头保证金率
+    double long_margin_ratio = 24;
+    // 空头保证金率
+    double short_margin_ratio = 25;
+    // 是否使用大额单边保证金算法
+    string max_margin_side_algorithm = 26;
+    // 基础商品代码
+    string underlying_instr_id = 27;
+    // 执行价
+    double strike_price = 28;
+    // 期权类型
+    string options_type = 29;
+    // 合约基础商品乘数
+    double underlying_multiple = 30;
+    // 组合类型
+    string combination_type = 31;
+}
+
+// 批量合约消息
+message InstrumentBatchMessage {
+    repeated InstrumentMessage instruments = 1;
+    // 消息时间戳
+    int64 timestamp = 2;
+    // 消息类型
+    string message_type = 3;
+} 

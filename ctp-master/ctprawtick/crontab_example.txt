@@ -1,0 +1,81 @@
+# CTP分离架构定时任务配置示例
+# 使用 crontab -e 编辑定时任务
+
+# =======================================
+# 1. 合约查询器 - 每日运行2次
+# =======================================
+
+# 每日8:30运行合约查询器（开盘前）
+30 8 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh start-instrument
+
+# 每日15:30运行合约查询器（收盘后）
+30 15 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh start-instrument
+
+# =======================================
+# 2. 持仓资金监控器 - 持续运行
+# =======================================
+
+# 每日8:45启动持仓资金监控器（确保在合约查询后启动）
+45 8 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh start-monitor
+
+# 每日21:00重启监控器（夜盘前）
+0 21 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh restart
+
+# =======================================
+# 3. 行情数据推送器 - 持续运行  
+# =======================================
+
+# 每日8:50启动行情推送器
+50 8 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh start-market
+
+# 每日21:05重启行情推送器（夜盘前）
+5 21 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh restart
+
+# =======================================
+# 4. 监控和维护任务
+# =======================================
+
+# 每小时检查程序状态（工作时间）
+0 9-14,21-23 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh status >> /tmp/ctp_status.log
+
+# 每日2:30停止所有程序（夜盘结束后）
+30 2 * * 2-6 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh stop
+
+# 每周日清理日志文件
+0 3 * * 0 find /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug -name "*.log" -mtime +7 -delete
+
+# =======================================
+# 5. 数据库维护任务 (protobuf架构)
+# =======================================
+
+# 每日凌晨3:00启动数据库订阅器（protobuf格式，30秒批量写入）
+0 3 * * 1-5 cd /home/zyc/projects/ctprade/zmq-dataupdate/build && nohup ./zmq_market_subscriber > subscriber.log 2>&1 &
+
+# =======================================
+# 时间说明:
+# =======================================
+# 分 时 日 月 周
+# 0-59 0-23 1-31 1-12 0-6 (0=周日)
+# 
+# 1-5 表示周一到周五（交易日）
+#
+# =======================================
+# 手动操作命令:
+# =======================================
+#
+# 查看定时任务:
+# crontab -l
+#
+# 编辑定时任务:
+# crontab -e
+#
+# 查看程序状态:
+# /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh status
+#
+# 手动启动所有程序:
+# /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh start-all
+#
+# 停止所有程序:
+# /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh stop
+#
+# ======================================= 

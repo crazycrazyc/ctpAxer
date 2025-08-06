@@ -1,0 +1,40 @@
+cmake_minimum_required(VERSION 3.5.1)
+
+# 项目名称
+PROJECT(CTPQuote)
+# 设置编译模式
+set(CMAKE_BUILD_TYPE "Release")
+# set(CMAKE_BUILD_TYPE "Debug")
+
+# 库头文件
+INCLUDE_DIRECTORIES(include)
+
+# 查找源文件
+AUX_SOURCE_DIRECTORY(src DIR_SRCS)
+
+#动态库链接目录
+LINK_DIRECTORIES("lib")
+
+# 编译选项
+SET(CXX_FLAGS -g -Wall)
+SET(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXX_FLAGS} -O0 -Wall -g -ggdb")
+SET(CMAKE_CXX_FLAGS_RELEASE "$ENV{CXX_FLAGS} -O3 -Wall")
+SET(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0 -Wall -g -ggdb")
+SET(CMAKE_CXX_FLAGS_RELEASE "$ENV{CXXFLAGS} -O3 -Wall")
+
+# 支持C++11
+ADD_DEFINITIONS(-std=c++11)
+
+# 设置debug/release输出路径
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${PROJECT_SOURCE_DIR}/bin/debug/)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${PROJECT_SOURCE_DIR}/bin/release)
+
+MESSAGE(STATUS ${DIR_SRCS})
+# MESSAGE(STATUS ${ZLOG_LIB})
+# MESSAGE(STATUS ${CTP_LIB})
+
+# 目标可执行文件
+ADD_EXECUTABLE(CTPQuote "${DIR_SRCS}")
+
+# 设置CTP外部库
+TARGET_LINK_LIBRARIES(CTPQuote zlog;thostmduserapi_se;thosttraderapi_se;zmq)

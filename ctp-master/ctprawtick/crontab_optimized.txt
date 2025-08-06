@@ -1,0 +1,90 @@
+# CTP分离架构优化定时任务配置
+# 针对用户需求优化：合约一天2次，持仓5分钟一次，行情10分钟一次
+# 使用 crontab -e 编辑定时任务
+
+# =======================================
+# 1. 合约查询器 - 每日运行2次
+# =======================================
+
+# 每日8:30运行合约查询器（开盘前）
+30 8 * * 1-5 /home/zyc/projects/ctprade/ctprawtick/start_system.sh start-instrument
+
+# 每日15:30运行合约查询器（收盘后）
+30 15 * * 1-5 /home/zyc/projects/ctprade/ctprawtick/start_system.sh start-instrument
+
+# =======================================
+# 2. 持仓资金监控器 - 每5分钟运行一次
+# =======================================
+
+# 交易时间段内每5分钟查询一次持仓资金
+# 白天场：9:00-15:00
+*/5 9-14 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug/ctpmonitor
+
+# 夜盘时间：21:00-23:00, 00:00-02:30
+*/5 21-23 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug/ctpmonitor
+*/5 0-2 * * 2-6 /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug/ctpmonitor
+
+# =======================================
+# 3. 行情数据推送器 - 每10分钟重启一次  
+# =======================================
+
+# 交易时间段内每10分钟重启行情推送器
+# 白天场：9:00-15:00
+*/10 9-14 * * 1-5 pkill -f ctpmarket; cd /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug && nohup ./ctpmarket > market.log 2>&1 &
+
+# 夜盘时间：21:00-23:00, 00:00-02:30
+*/10 21-23 * * 1-5 pkill -f ctpmarket; cd /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug && nohup ./ctpmarket > market.log 2>&1 &
+*/10 0-2 * * 2-6 pkill -f ctpmarket; cd /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug && nohup ./ctpmarket > market.log 2>&1 &
+
+# =======================================
+# 4. 系统维护任务
+# =======================================
+
+# 交易日开始前清理旧进程
+25 8 * * 1-5 pkill -f ctp
+
+# 夜盘结束后停止所有程序
+35 2 * * 2-6 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh stop
+
+# 每周日清理日志文件
+0 3 * * 0 find /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug -name "*.log" -mtime +7 -delete
+
+# =======================================
+# 5. 状态监控任务
+# =======================================
+
+# 每小时检查程序状态并记录日志
+0 9-14,21-23 * * 1-5 /home/zyc/projects/ctprade/ctp-master/ctprawtick/start_system.sh status >> /tmp/ctp_status_$(date +\%Y\%m\%d).log
+
+# =======================================
+# 使用说明:
+# =======================================
+# 
+# 1. 安装定时任务:
+#    crontab crontab_optimized.txt
+#
+# 2. 查看当前定时任务:
+#    crontab -l
+#
+# 3. 编辑定时任务:
+#    crontab -e
+#
+# 4. 手动测试单个程序:
+#    cd /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug
+#    ./ctpinstrument     # 合约查询
+#    ./ctpmonitor        # 持仓查询
+#    ./ctpmarket         # 行情推送
+#
+# 5. 查看日志:
+#    tail -f /home/zyc/projects/ctprade/ctp-master/ctprawtick/bin/debug/market.log
+#    tail -f /tmp/ctp_status_$(date +%Y%m%d).log
+#
+# =======================================
+# 时间格式说明:
+# =======================================
+# 分 时 日 月 周
+# */5 = 每5分钟
+# */10 = 每10分钟  
+# 1-5 = 周一到周五
+# 2-6 = 周二到周六（用于夜盘）
+# ======================================= 

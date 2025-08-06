@@ -1,0 +1,953 @@
+#include <string>
+#include <cstring>
+#include <linux/limits.h>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <condition_variable>
+#include <mutex>
+#include "zlog.h"
+#include "CTPTrader.h"
+// #include <mysql_driver.h>
+// #include <mysql_connection.h>
+// #include <cppconn/prepared_statement.h>
+// #include <cppconn/resultset.h>
+// #include <cppconn/statement.h>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
+#include "../include/ProtobufConverter.h"
+#include "../proto/instrument.pb.h"
+#include "../proto/investor_position.pb.h"
+#include "../include/ZMQPublisher.h"
+
+// #include "../include/zycMain.h"
+
+using namespace std;
+
+// global variable
+vector<string>      contracts;
+vector<CThostFtdcInstrumentField> allInstruments;
+vector<CThostFtdcInvestorPositionField> allPositions;
+
+condition_variable  cv;
+mutex               m;
+bool                isReady = false;
+bool                isPositionReady = false;
+bool                isTradingAccountReady = false;
+ZMQPublisher publisher("tcp://*:8890");
+
+// external global variable
+extern zlog_category_t *cat;
+
+void CTPTraderSpi::OnFrontConnected()
+{
+    zlog_info(cat, "[CTPTraderSpi::OnFrontConnected] .");
+    //Authenticate();
+    //zlog_info(cat, "[CTPTraderSpi::OnFrontConnected] 开始认证流程");
+    Login();
+}
+
+void CTPTraderSpi::OnFrontDisconnected(int nReason)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnFrontDisconnected] Reason: %d", nReason);
+    chrono::seconds dura(10);
+    this_thread::sleep_for(dura);
+}
+
+void CTPTraderSpi::OnHeartBeatWarning(int nTimeLapse)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnHeartBeatWarning] %d", nTimeLapse);
+}
+
+void CTPTraderSpi::OnRspAuthenticate(CThostFtdcRspAuthenticateField *pRspAuthenticateField,
+                                     CThostFtdcRspInfoField         *pRspInfo,
+                                     int                            nRequestID,
+                                     bool                           bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspAuthenticate] .");
+    if (pRspInfo->ErrorID != 0)
+    {
+        zlog_error(cat, "[CTPTraderSpi::OnRspAuthenticate] 客户端认证回报 错误代码: [%d]", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspAuthenticate] 客户端认证回报 错误信息: [%s]", pRspInfo->ErrorMsg);
+        return;
+    }
+    Login();
+}
+
+void CTPTraderSpi::OnRspUserLogin(CThostFtdcRspUserLoginField *pRspUserLogin,
+                                  CThostFtdcRspInfoField      *pRspInfo,
+                                  int                         nRequestID,
+                                  bool                        bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] .");
+    if (pRspInfo->ErrorID != 0)
+    {
+        zlog_error(cat, "[CTPTraderSpi::OnRspUserLogin] 交易服务器登陆出错，错误码:%d", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspUserLogin] 交易服务器登陆出错，错误信息:%s", pRspInfo->ErrorMsg);
+        return;
+    }
+
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 交易服务器登陆成功");
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 当前交易日: %s", api->GetTradingDay());
+
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 开始查询合约");
+    ReqInstruments();
+    
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 准备启动持仓查询线程");
+    
+    try {
+    // 等待合约查询完成后查询持仓
+    std::thread([this]() {
+            zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 持仓查询线程启动，等待合约查询完成");
+            
+            // 使用轮询方式等待，避免条件变量的竞态条件
+            int waitCount = 0;
+            const int maxWaitCount = 600; // 60秒超时 (600 * 100ms)，给合约查询更多时间
+            
+            while (!isReady && waitCount < maxWaitCount) {
+                if (waitCount % 50 == 0) { // 每5秒打印一次，减少日志
+                    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 检查isReady=%s，继续等待 (等待次数: %d/%d)", 
+                             isReady ? "true" : "false", waitCount, maxWaitCount);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                waitCount++;
+            }
+            
+            // 只有在isReady为true时才查询持仓，超时不查询
+            if (isReady) {
+        zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 合约查询完成，开始查询持仓");
+                
+                // 等待1秒让合约查询的网络请求彻底完成
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                
+                // 直接调用API查询持仓
+                CThostFtdcQryInvestorPositionField req;
+                memset(&req, 0, sizeof(CThostFtdcQryInvestorPositionField));
+                strncpy(req.BrokerID, this->brokerid.c_str(), sizeof(TThostFtdcBrokerIDType));
+                strncpy(req.InvestorID, this->userid.c_str(), sizeof(TThostFtdcInvestorIDType));
+                int ret = this->api->ReqQryInvestorPosition(&req, this->requestid++);
+                zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 发送请求持仓=%d, BrokerID=%s, InvestorID=%s", ret, this->brokerid.c_str(), this->userid.c_str());
+                
+                // 如果持仓查询请求失败，直接设置isPositionReady
+                if (ret != 0) {
+                    zlog_warn(cat, "[CTPTraderSpi::OnRspUserLogin] 持仓查询请求失败，直接设置isPositionReady=true");
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        isPositionReady = true;
+                    }
+                    zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 持仓查询失败，isPositionReady已设置为true");
+                }
+            } else {
+                zlog_warn(cat, "[CTPTraderSpi::OnRspUserLogin] 合约查询超时，跳过持仓查询");
+                {
+                    std::lock_guard<std::mutex> lock(m);
+                    isPositionReady = true;
+                }
+                zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 超时情况下isPositionReady已设置为true");
+            }
+    }).detach();
+        zlog_info(cat, "[CTPTraderSpi::OnRspUserLogin] 持仓查询线程已启动");
+    } catch (const std::exception& e) {
+        zlog_error(cat, "[CTPTraderSpi::OnRspUserLogin] 启动持仓查询线程时发生异常: %s", e.what());
+    } catch (...) {
+        zlog_error(cat, "[CTPTraderSpi::OnRspUserLogin] 启动持仓查询线程时发生未知异常");
+    }
+    
+}
+
+void CTPTraderSpi::OnRspUserPasswordUpdate(CThostFtdcUserPasswordUpdateField *pUserPasswordUpdate,
+                                           CThostFtdcRspInfoField            *pRspInfo,
+                                           int                               nRequestID,
+                                           bool                              bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserPasswordUpdate] .");
+}
+
+void CTPTraderSpi::OnRspTradingAccountPasswordUpdate(
+        CThostFtdcTradingAccountPasswordUpdateField *pTradingAccountPasswordUpdate,
+        CThostFtdcRspInfoField                      *pRspInfo,
+        int                                         nRequestID,
+        bool                                        bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspTradingAccountPasswordUpdate] .");
+}
+
+void CTPTraderSpi::OnRspUserAuthMethod(CThostFtdcRspUserAuthMethodField *pRspUserAuthMethod,
+                                       CThostFtdcRspInfoField           *pRspInfo,
+                                       int                              nRequestID,
+                                       bool                             bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspUserAuthMethod] .");
+}
+
+void CTPTraderSpi::OnRspGenUserCaptcha(CThostFtdcRspGenUserCaptchaField *pRspGenUserCaptcha,
+                                       CThostFtdcRspInfoField           *pRspInfo,
+                                       int                              nRequestID,
+                                       bool                             bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspGenUserCaptcha] .");
+}
+
+void CTPTraderSpi::OnRspGenUserText(CThostFtdcRspGenUserTextField *pRspGenUserText,
+                                    CThostFtdcRspInfoField        *pRspInfo,
+                                    int                           nRequestID,
+                                    bool                          bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspGenUserText] .");
+}
+
+void CTPTraderSpi::OnRspOrderInsert(CThostFtdcInputOrderField *pInputOrder,
+                                    CThostFtdcRspInfoField    *pRspInfo,
+                                    int                       nRequestID,
+                                    bool                      bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspGenUserText] .");
+}
+
+void CTPTraderSpi::OnRspParkedOrderInsert(CThostFtdcParkedOrderField *pParkedOrder,
+                                          CThostFtdcRspInfoField     *pRspInfo,
+                                          int                        nRequestID,
+                                          bool                       bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspParkedOrderInsert] .");
+}
+
+void CTPTraderSpi::OnRspParkedOrderAction(CThostFtdcParkedOrderActionField *pParkedOrderAction,
+                                          CThostFtdcRspInfoField           *pRspInfo,
+                                          int                              nRequestID,
+                                          bool                             bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspParkedOrderAction] .");
+}
+
+void CTPTraderSpi::OnRspOrderAction(CThostFtdcInputOrderActionField *pInputOrderAction,
+                                    CThostFtdcRspInfoField          *pRspInfo,
+                                    int                             nRequestID,
+                                    bool                            bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspOrderAction] .");
+}
+
+void CTPTraderSpi::OnRspQueryMaxOrderVolume(CThostFtdcQueryMaxOrderVolumeField *pQueryMaxOrderVolume,
+                                            CThostFtdcRspInfoField             *pRspInfo,
+                                            int                                nRequestID,
+                                            bool                               bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQueryMaxOrderVolume] .");
+}
+
+void CTPTraderSpi::OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoConfirmField *pSettlementInfoConfirm,
+                                              CThostFtdcRspInfoField               *pRspInfo,
+                                              int                                  nRequestID,
+                                              bool                                 bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspSettlementInfoConfirm] .");
+}
+
+void CTPTraderSpi::OnRspRemoveParkedOrder(CThostFtdcRemoveParkedOrderField *pRemoveParkedOrder,
+                                          CThostFtdcRspInfoField           *pRspInfo,
+                                          int                              nRequestID,
+                                          bool                             bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspRemoveParkedOrder] .");
+}
+
+void CTPTraderSpi::OnRspRemoveParkedOrderAction(
+    CThostFtdcRemoveParkedOrderActionField *pRemoveParkedOrderAction,
+    CThostFtdcRspInfoField                 *pRspInfo,
+    int                                    nRequestID,
+    bool                                   bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspRemoveParkedOrderAction] .");
+}
+
+void CTPTraderSpi::OnRspBatchOrderAction(CThostFtdcInputBatchOrderActionField *pInputBatchOrderAction,
+                                         CThostFtdcRspInfoField               *pRspInfo,
+                                         int                                  nRequestID,
+                                         bool                                 bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspBatchOrderAction] .");
+}
+
+void CTPTraderSpi::OnRspQryOrder(CThostFtdcOrderField     *pOrder,
+                                 CThostFtdcRspInfoField   *pRspInfo,
+                                 int                      nRequestID,
+                                 bool                     bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryOrder] .");
+}
+
+void CTPTraderSpi::OnRspQryTrade(CThostFtdcTradeField     *pTrade,
+                                 CThostFtdcRspInfoField   *pRspInfo,
+                                 int                      nRequestID,
+                                 bool                     bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryTrade] .");
+}
+
+void CTPTraderSpi::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField *pInvestorPosition,
+                                            CThostFtdcRspInfoField          *pRspInfo,
+                                            int                             nRequestID,
+                                            bool                            bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 收到持仓回调, RequestID=%d, IsLast=%s", nRequestID, bIsLast ? "true" : "false");
+    
+    if (pRspInfo)
+    {
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 错误码:%d", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 错误信息:%s", pRspInfo->ErrorMsg);
+        return;
+    }
+
+    if (pInvestorPosition)
+    {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 收到持仓数据: %s, 持仓数量: %d", pInvestorPosition->InstrumentID, pInvestorPosition->Position);
+        
+        // 使用protobuf处理持仓数据
+        CThostFtdcInvestorPositionField position = *pInvestorPosition;
+        
+        // 转换为protobuf格式
+        ctp::InvestorPositionMessage positionMessage = ProtobufConverter::convertToProtobuf(position);
+        
+        // 序列化为字符串用于日志记录
+        std::string serialized = ProtobufConverter::serializeToString(positionMessage);
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 持仓转换为protobuf格式: %s", pInvestorPosition->InstrumentID);
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] Protobuf序列化大小: %zu 字节", serialized.size());
+        
+        // 存储原始CTP数据用于ZMQ发布
+        allPositions.push_back(position);
+    }
+    else
+    {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 收到空持仓数据（pInvestorPosition为nullptr）");
+    }
+
+    // 无论是否有持仓数据，都要在最后一条记录时设置isPositionReady
+        if (bIsLast)
+        {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 持仓查询完成，总共收到 %zu 条持仓记录", allPositions.size());
+        
+            {
+                std::lock_guard<std::mutex> lock(m);
+                isPositionReady = true;
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] isPositionReady已设置为true");
+            }
+
+            // 使用protobuf批量处理持仓数据
+            if (!allPositions.empty()) {
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 开始protobuf批量处理 %zu 个持仓", allPositions.size());
+                
+                // 转换为protobuf批量消息
+                ctp::InvestorPositionBatchMessage batchMessage = ProtobufConverter::convertBatchToProtobuf(allPositions);
+                
+                // 序列化批量消息
+                std::string batchSerialized = ProtobufConverter::serializeToString(batchMessage);
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] Protobuf批量消息大小: %zu 字节", batchSerialized.size());
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 批量消息时间戳: %lld", batchMessage.timestamp());
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 批量消息类型: %s", batchMessage.message_type().c_str());
+                
+            // 通过ZMQ发布持仓数据（Protobuf格式）
+            bool publishSuccess = publisher.publishMessage("CTP_INVESTOR_POSITION_BATCH_UPDATE", batchSerialized);
+            if (publishSuccess) {
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 成功发布 %zu 个持仓记录到ZMQ", allPositions.size());
+            } else {
+                zlog_error(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] ZMQ发布失败");
+            }
+                
+                // 同时发送CSV格式的持仓数据
+                std::ostringstream csvData;
+                for (const auto& position : allPositions) {
+                    csvData << position.InstrumentID << ","
+                           << position.BrokerID << ","
+                           << position.InvestorID << ","
+                           << position.PosiDirection << ","
+                           << position.HedgeFlag << ","
+                           << position.PositionDate << ","
+                           << position.YdPosition << ","
+                           << position.Position << ","
+                           << position.LongFrozen << ","
+                           << position.ShortFrozen << ","
+                           << position.LongFrozenAmount << ","
+                           << position.ShortFrozenAmount << ","
+                           << position.OpenVolume << ","
+                           << position.CloseVolume << ","
+                           << position.OpenAmount << ","
+                           << position.CloseAmount << ","
+                           << position.PositionCost << ","
+                           << position.PreMargin << ","
+                           << position.UseMargin << ","
+                           << position.FrozenMargin << ","
+                           << position.FrozenCash << ","
+                           << position.FrozenCommission << ","
+                           << position.CashIn << ","
+                           << position.Commission << ","
+                           << position.CloseProfit << ","
+                           << position.PositionProfit << ","
+                           << position.PreSettlementPrice << ","
+                           << position.SettlementPrice << ","
+                           << position.TradingDay << ","
+                           << position.SettlementID << ","
+                           << position.OpenCost << ","
+                           << position.ExchangeMargin << ","
+                           << position.CombPosition << ","
+                           << position.CombLongFrozen << ","
+                           << position.CombShortFrozen << ","
+                           << position.CloseProfitByDate << ","
+                           << position.CloseProfitByTrade << ","
+                           << position.TodayPosition << ","
+                           << position.MarginRateByMoney << ","
+                           << position.MarginRateByVolume << ","
+                           << position.StrikeFrozen << ","
+                           << position.StrikeFrozenAmount << ","
+                           << position.AbandonFrozen << ","
+                           << position.ExchangeID << ","
+                           << position.YdStrikeFrozen << ","
+                           << position.InvestUnitID << ","
+                       << position.PositionCostOffset << ","
+                       << "0" << ","  // TasPosition - 默认为0
+                       << "0" << "\n";  // TasCost - 默认为0
+                }
+                
+                std::string csvSerialized = csvData.str();
+            bool csvPublishSuccess = publisher.publishMessage("CTP_INVESTOR_POSITION_CSV_UPDATE", csvSerialized);
+            if (csvPublishSuccess) {
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 成功发布CSV格式持仓数据，大小: %zu 字节", csvSerialized.size());
+            } else {
+                zlog_error(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] CSV格式持仓数据发布失败");
+            }
+        } else {
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPosition] 没有持仓数据需要发布");
+        }
+    }
+}
+
+void CTPTraderSpi::OnRspQryTradingAccount(CThostFtdcTradingAccountField *pTradingAccount,
+                                            CThostFtdcRspInfoField        *pRspInfo,
+                                            int                           nRequestID,
+                                            bool                          bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 收到资金账户回调, RequestID=%d, IsLast=%s", nRequestID, bIsLast ? "true" : "false");
+    
+    if (pRspInfo && pRspInfo->ErrorID != 0) {
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 错误码:%d", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 错误信息:%s", pRspInfo->ErrorMsg);
+        if (bIsLast) {
+            isTradingAccountReady = true;
+        }
+        return;
+    }
+    
+    if (pTradingAccount) {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 收到资金账户数据: 账户=%s, 可用资金=%.2f, 账户余额=%.2f", 
+                  pTradingAccount->AccountID, pTradingAccount->Available, pTradingAccount->Balance);
+        
+        // 构建CSV格式的资金账户数据
+        std::ostringstream csvStream;
+        csvStream << "CTP_TRADING_ACCOUNT,"
+                  << pTradingAccount->BrokerID << ","
+                  << pTradingAccount->AccountID << ","
+                  << pTradingAccount->PreMortgage << ","
+                  << pTradingAccount->PreCredit << ","
+                  << pTradingAccount->PreDeposit << ","
+                  << pTradingAccount->PreBalance << ","
+                  << pTradingAccount->PreMargin << ","
+                  << pTradingAccount->InterestBase << ","
+                  << pTradingAccount->Interest << ","
+                  << pTradingAccount->Deposit << ","
+                  << pTradingAccount->Withdraw << ","
+                  << pTradingAccount->FrozenMargin << ","
+                  << pTradingAccount->FrozenCash << ","
+                  << pTradingAccount->FrozenCommission << ","
+                  << pTradingAccount->CurrMargin << ","
+                  << pTradingAccount->CashIn << ","
+                  << pTradingAccount->Commission << ","
+                  << pTradingAccount->CloseProfit << ","
+                  << pTradingAccount->PositionProfit << ","
+                  << pTradingAccount->Balance << ","
+                  << pTradingAccount->Available << ","
+                  << pTradingAccount->WithdrawQuota << ","
+                  << pTradingAccount->Reserve << ","
+                  << pTradingAccount->TradingDay << ","
+                  << pTradingAccount->SettlementID << ","
+                  << pTradingAccount->Credit << ","
+                  << pTradingAccount->Mortgage << ","
+                  << pTradingAccount->ExchangeMargin << ","
+                  << pTradingAccount->DeliveryMargin << ","
+                  << pTradingAccount->ExchangeDeliveryMargin << ","
+                  << pTradingAccount->ReserveBalance << ","
+                  << pTradingAccount->CurrencyID << ","
+                  << pTradingAccount->PreFundMortgageIn << ","
+                  << pTradingAccount->PreFundMortgageOut << ","
+                  << pTradingAccount->FundMortgageIn << ","
+                  << pTradingAccount->FundMortgageOut << ","
+                  << pTradingAccount->FundMortgageAvailable << ","
+                  << pTradingAccount->MortgageableFund << ","
+                  << pTradingAccount->SpecProductMargin << ","
+                  << pTradingAccount->SpecProductFrozenMargin << ","
+                  << pTradingAccount->SpecProductCommission << ","
+                  << pTradingAccount->SpecProductFrozenCommission << ","
+                  << pTradingAccount->SpecProductPositionProfit << ","
+                  << pTradingAccount->SpecProductCloseProfit << ","
+                  << pTradingAccount->SpecProductPositionProfitByAlg << ","
+                  << pTradingAccount->SpecProductExchangeMargin << ","
+                  << (pTradingAccount->BizType ? std::string(1, pTradingAccount->BizType) : "") << ","
+                  << pTradingAccount->FrozenSwap << ","
+                  << pTradingAccount->RemainSwap;
+        
+        std::string csvData = csvStream.str();
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 资金账户CSV数据长度: %zu", csvData.length());
+        
+        // 通过ZMQ发布资金账户数据
+        if (publisher.publishMessage("CTP_TRADING_ACCOUNT_CSV_UPDATE", csvData)) {
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 成功发布资金账户数据: %s", pTradingAccount->AccountID);
+        } else {
+            zlog_error(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 资金账户数据发布失败: %s", pTradingAccount->AccountID);
+        }
+    } else {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 收到空资金账户数据（pTradingAccount为nullptr）");
+    }
+    
+    if (bIsLast) {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] 资金账户查询完成");
+        isTradingAccountReady = true;
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryTradingAccount] isTradingAccountReady已设置为true");
+    }
+}
+
+void CTPTraderSpi::OnRspQryInvestor(CThostFtdcInvestorField   *pInvestor,
+                                    CThostFtdcRspInfoField    *pRspInfo,
+                                    int                       nRequestID,
+                                    bool                      bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestor] .");
+}
+
+void CTPTraderSpi::OnRspQryInstrumentMarginRate(
+    CThostFtdcInstrumentMarginRateField *pInstrumentMarginRate,
+    CThostFtdcRspInfoField              *pRspInfo,
+    int                                 nRequestID,
+    bool                                bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrumentMarginRate] .");
+}
+
+void CTPTraderSpi::OnRspQryInstrumentCommissionRate(
+    CThostFtdcInstrumentCommissionRateField *pInstrumentCommissionRate,
+    CThostFtdcRspInfoField                  *pRspInfo,
+    int                                     nRequestID,
+    bool                                    bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrumentCommissionRate] .");
+}
+
+void CTPTraderSpi::OnRspQryExchange(CThostFtdcExchangeField *pExchange,
+                                    CThostFtdcRspInfoField  *pRspInfo,
+                                    int                     nRequestID,
+                                    bool                    bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryExchange] .");
+}
+
+void CTPTraderSpi::OnRspQryProduct(CThostFtdcProductField *pProduct,
+                                   CThostFtdcRspInfoField *pRspInfo,
+                                   int                    nRequestID,
+                                   bool                   bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryProduct] .");
+}
+
+void CTPTraderSpi::OnRspQryInstrument(CThostFtdcInstrumentField *pInstrument,
+                                      CThostFtdcRspInfoField    *pRspInfo,
+                                      int                       nRequestID,
+                                      bool                      bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 收到合约回调, RequestID=%d, IsLast=%s, pInstrument=%s", 
+              nRequestID, bIsLast ? "true" : "false", pInstrument ? "非空" : "空");
+    
+    if (pRspInfo && pRspInfo->ErrorID != 0)
+    {
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryInstrument] 错误码:%d", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspQryInstrument] 错误信息:%s", pRspInfo->ErrorMsg);
+        
+        // 即使有错误，如果是最后一条记录也要设置isReady
+        if (bIsLast)
+        {
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 合约查询出错但已完成，设置isReady=true");
+            {
+                std::lock_guard<std::mutex> lock(m);
+                isReady = true;
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] isReady已设置为true");
+            }
+            cv.notify_one();
+        }
+        return;
+    }
+
+    if (pInstrument)
+    {
+        contracts.push_back(pInstrument->ExchangeInstID);
+
+        // 使用protobuf处理合约数据
+        CThostFtdcInstrumentField instrument = *pInstrument;
+        
+        // 转换为protobuf格式
+        ctp::InstrumentMessage instrumentMessage = ProtobufConverter::convertToProtobuf(instrument);
+        
+        // 序列化为字符串用于日志记录
+        std::string serialized = ProtobufConverter::serializeToString(instrumentMessage);
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 合约转换为protobuf格式: %s", pInstrument->InstrumentID);
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] Protobuf序列化大小: %zu 字节", serialized.size());
+        
+        // 存储原始CTP数据用于ZMQ发布
+        allInstruments.push_back(instrument);
+    }
+
+    // 无论是否有合约数据，都要在最后一条记录时设置isReady
+        if (bIsLast)
+        {
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 合约查询完成，设置isReady=true");
+            {
+                std::lock_guard<std::mutex> lock(m);
+                
+                isReady = true;
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] isReady已设置为true");
+            }
+            
+            // 使用protobuf批量处理合约数据
+            if (!allInstruments.empty()) {
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 开始protobuf批量处理 %zu 个合约", allInstruments.size());
+                
+                // 转换为protobuf批量消息
+                ctp::InstrumentBatchMessage batchMessage = ProtobufConverter::convertBatchToProtobuf(allInstruments);
+                
+                // 序列化批量消息
+                std::string batchSerialized = ProtobufConverter::serializeToString(batchMessage);
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] Protobuf批量消息大小: %zu 字节", batchSerialized.size());
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 批量消息时间戳: %lld", batchMessage.timestamp());
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 批量消息类型: %s", batchMessage.message_type().c_str());
+                
+
+
+                publisher.publishMessage("CTP_INSTRUMENT_BATCH_UPDATE", batchSerialized);
+                
+                // 同时发送CSV格式的合约数据
+                std::ostringstream csvData;
+                for (const auto& instrument : allInstruments) {
+                    csvData << instrument.InstrumentID << ","
+                           << instrument.ExchangeID << ","
+                           << instrument.InstrumentName << ","
+                           << instrument.ExchangeInstID << ","
+                           << instrument.ProductID << ","
+                           << instrument.ProductClass << ","
+                           << instrument.DeliveryYear << ","
+                           << instrument.DeliveryMonth << ","
+                           << instrument.MaxMarketOrderVolume << ","
+                           << instrument.MinMarketOrderVolume << ","
+                           << instrument.MaxLimitOrderVolume << ","
+                           << instrument.MinLimitOrderVolume << ","
+                           << instrument.VolumeMultiple << ","
+                           << instrument.PriceTick << ","
+                           << instrument.CreateDate << ","
+                           << instrument.OpenDate << ","
+                           << instrument.ExpireDate << ","
+                           << instrument.StartDelivDate << ","
+                           << instrument.EndDelivDate << ","
+                           << instrument.InstLifePhase << ","
+                           << (instrument.IsTrading ? "1" : "0") << ","
+                           << instrument.PositionType << ","
+                           << instrument.PositionDateType << ","
+                           << instrument.LongMarginRatio << ","
+                           << instrument.ShortMarginRatio << ","
+                           << instrument.MaxMarginSideAlgorithm << ","
+                           << instrument.UnderlyingInstrID << ","
+                           << instrument.StrikePrice << ","
+                           << instrument.OptionsType << ","
+                           << instrument.UnderlyingMultiple << ","
+                           << instrument.CombinationType << "\n";
+                }
+                
+            std::string csvSerialized = csvData.str();
+            bool csvPublishSuccess = publisher.publishMessage("INSTRUMENT", csvSerialized);
+            if (csvPublishSuccess) {
+                zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 成功发布CSV格式合约数据，大小: %zu 字节", csvSerialized.size());
+            } else {
+                zlog_error(cat, "[CTPTraderSpi::OnRspQryInstrument] CSV格式合约数据发布失败");
+            }
+        } else {
+            zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 没有合约数据需要发布");
+        }
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] 准备调用cv.notify_one()");
+            cv.notify_one();
+        zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrument] cv.notify_one()已调用");
+    }
+}
+
+void CTPTraderSpi::OnRspQryDepthMarketData(CThostFtdcDepthMarketDataField *pDepthMarketData,
+                                           CThostFtdcRspInfoField         *pRspInfo,
+                                           int                            nRequestID,
+                                           bool                           bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryDepthMarketData] .");
+}
+
+void CTPTraderSpi::OnRspQryInvestorPositionDetail(
+    CThostFtdcInvestorPositionDetailField *pInvestorPositionDetail,
+    CThostFtdcRspInfoField                *pRspInfo,
+    int                                   nRequestID,
+    bool                                  bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInvestorPositionDetail] .");
+}
+
+void CTPTraderSpi::OnRspQryExchangeMarginRate(CThostFtdcExchangeMarginRateField *pExchangeMarginRate,
+                                              CThostFtdcRspInfoField            *pRspInfo,
+                                              int                               nRequestID,
+                                              bool                              bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryExchangeMarginRate] .");
+}
+
+void CTPTraderSpi::OnRspQryProductGroup(CThostFtdcProductGroupField *pProductGroup,
+                                        CThostFtdcRspInfoField      *pRspInfo,
+                                        int                         nRequestID,
+                                        bool                        bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryProductGroup] .");
+}
+
+void CTPTraderSpi::OnRspQryInstrumentOrderCommRate(
+    CThostFtdcInstrumentOrderCommRateField *pInstrumentOrderCommRate,
+    CThostFtdcRspInfoField                 *pRspInfo,
+    int                                     nRequestID,
+    bool                                    bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspQryInstrumentOrderCommRate] .");
+}
+
+void CTPTraderSpi::OnRspError(CThostFtdcRspInfoField *pRspInfo, int nRequestID, bool bIsLast)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRspError] .");
+    if (pRspInfo->ErrorID != 0)
+    {
+        zlog_error(cat, "[CTPTraderSpi::OnRspError]行情错误回报 错误代码: [%d]", pRspInfo->ErrorID);
+        zlog_error(cat, "[CTPTraderSpi::OnRspError]行情错误回报 错误信息: [%s]", pRspInfo->ErrorMsg);
+    }
+}
+
+void CTPTraderSpi::OnRtnOrder(CThostFtdcOrderField *pOrder)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRtnOrder] .");
+}
+
+void CTPTraderSpi::OnRtnTrade(CThostFtdcTradeField *pTrade)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRtnTrade] .");
+}
+
+void CTPTraderSpi::OnErrRtnOrderInsert(CThostFtdcInputOrderField *pInputOrder,
+                                       CThostFtdcRspInfoField    *pRspInfo)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnErrRtnOrderInsert] .");
+}
+
+void CTPTraderSpi::OnErrRtnOrderAction(CThostFtdcOrderActionField *pOrderAction,
+                                       CThostFtdcRspInfoField     *pRspInfo)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnErrRtnOrderAction] .");
+}
+
+void CTPTraderSpi::OnRtnInstrumentStatus(CThostFtdcInstrumentStatusField *pInstrumentStatus)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRtnInstrumentStatus] .");
+    zlog_info(cat, "[CTPTraderSpi::OnRtnInstrumentStatus] 合约代码[%s],状态[%c],阶段编码[%d],时间[%s],原因[%c]",
+        pInstrumentStatus->InstrumentID, pInstrumentStatus->InstrumentStatus, pInstrumentStatus->TradingSegmentSN,
+        pInstrumentStatus->EnterTime, pInstrumentStatus->EnterReason);
+}
+
+void CTPTraderSpi::OnRtnExecOrder(CThostFtdcExecOrderField *pExecOrder)
+{
+    zlog_info(cat, "[CTPTraderSpi::OnRtnExecOrder] .");
+}
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////
+// USER DEFINE FUNCTION
+/////////////////////////////////////////////////////////////////////////////////////////
+
+bool CTPTraderSpi::Create(const CAppConfig& appConfig)
+{
+    // // 初始化数据库管理器指针
+    // dbManager = nullptr;
+    
+    // // 初始化数据库管理器 - 延迟连接
+    //     try {
+    //         zlog_info(cat, "[CTPTraderSpi::Create] 初始化数据库管理器...");
+    //         if (!dbManager->connect()) {
+    //             zlog_error(cat, "[CTPTraderSpi::Create] 数据库连接失败");
+    //             return false;
+    //         }
+    //         zlog_info(cat, "[CTPTraderSpi::Create] 数据库管理器创建成功，延迟连接");
+    //     } catch (std::exception &e) {
+    //         zlog_error(cat, "[CTPTraderSpi::Create] 数据库管理器创建异常: %s", e.what());
+    //         dbManager = nullptr;
+    //         return false;
+    //     } catch (...) {
+    //         zlog_error(cat, "[CTPTraderSpi::Create] 数据库管理器创建未知异常");
+    //         dbManager = nullptr;
+    //         return false;
+    //     }
+    // return true;
+
+    if (!publisher.connect()) {
+        zlog_error(cat, "[CTPTraderSpi::Create] ZMQ发布者连接失败");
+        return false;
+    }
+    zlog_info(cat, "[CTPTraderSpi::Create] ZMQ发布者连接成功");
+    api = CThostFtdcTraderApi::CreateFtdcTraderApi();
+    if (api)
+    {
+        char addrBuf[PATH_MAX] = {0};
+        snprintf(addrBuf, sizeof(addrBuf), "tcp://%s", appConfig.td_server.c_str());
+        brokerid = appConfig.brokerid;
+        userid   = appConfig.userid;
+        password = appConfig.password;
+        appid    = appConfig.appid;
+        authcode = appConfig.authcode;
+
+        zlog_info(cat, "[CTPTraderSpi::Create] API Version: %s", api->GetApiVersion());
+        zlog_info(cat, "[CTPTraderSpi::Create] Trade Server Addr: %s", addrBuf);
+
+        api->RegisterSpi(this);
+        api->SubscribePrivateTopic(THOST_TERT_QUICK);
+        api->SubscribePublicTopic(THOST_TERT_QUICK);
+        api->RegisterFront(addrBuf);
+        api->Init();
+        requestid = 0;
+        
+        
+        
+        return true;
+    }
+    return false;
+}
+
+void CTPTraderSpi::Authenticate()
+{
+    zlog_info(cat, "[CTPTraderSpi::Authenticate] .");
+    CThostFtdcReqAuthenticateField req = {0};
+    strncpy(req.BrokerID, brokerid.c_str(), sizeof(TThostFtdcBrokerIDType));
+    strncpy(req.UserID, userid.c_str(), sizeof(TThostFtdcUserIDType));
+    // strncpy(req.AppID, appid.c_str(), sizeof(TThostFtdcAppIDType));
+    // strncpy(req.AuthCode, authcode.c_str(), sizeof(TThostFtdcAuthCodeType));
+    
+    // 如果appid和authcode为空，使用默认值
+    if (appid.empty()) {
+        strncpy(req.AppID, "client_default_1.0.0", sizeof(TThostFtdcAppIDType));
+        zlog_info(cat, "[CTPTraderSpi::Authenticate] 使用默认AppID: client_default_1.0.0");
+    } else {
+    strncpy(req.AppID, appid.c_str(), sizeof(TThostFtdcAppIDType));
+    }
+    
+    if (authcode.empty()) {
+        strncpy(req.AuthCode, "default_auth_code", sizeof(TThostFtdcAuthCodeType));
+        zlog_info(cat, "[CTPTraderSpi::Authenticate] 使用默认AuthCode: default_auth_code");
+    } else {
+    strncpy(req.AuthCode, authcode.c_str(), sizeof(TThostFtdcAuthCodeType));
+    }
+    
+    int ret = api->ReqAuthenticate(&req, requestid++);
+    zlog_info(cat, "[CTPTraderSpi::Authenticate] 客户端认证=%d", ret);
+}
+
+void CTPTraderSpi::Login()
+{
+    zlog_info(cat, "[CTPTraderSpi::login] .");
+
+    CThostFtdcReqUserLoginField req = {0};
+
+    strncpy(req.BrokerID, brokerid.c_str(), sizeof(TThostFtdcBrokerIDType));
+    strncpy(req.UserID, userid.c_str(), sizeof(TThostFtdcUserIDType));
+    strncpy(req.Password, password.c_str(), sizeof(TThostFtdcPasswordType));
+
+    if (api)
+    {
+        int ret = api->ReqUserLogin(&req, ++requestid);
+        switch (ret)
+        {
+        case 0:
+            zlog_info(cat, "[CTPTraderSpi::login] 登陆请求发送成功. [0]");
+            break;
+        case -1:
+            zlog_error(cat, "[CTPTraderSpi::login] 因为网络原因，登陆请求发送失败 [-1]");
+            break;
+        case -2:
+            zlog_error(cat, "[CTPTraderSpi::login] 未处理，请求队列总数量超限 [-2]");
+            break;
+        case -3:
+            zlog_error(cat, "[CTPTraderSpi::login] 每秒发送请求数量超限 [-3]");
+            break;
+        default:
+            zlog_error(cat, "[CTPTraderSpi::login] 未知返回错误码 [%d]", ret);
+            break;
+        }
+    }
+    else
+    {
+        zlog_error(cat, "[CTPTraderSpi::login] api is invalid.");
+    }
+}
+
+void CTPTraderSpi::ReqInstruments()
+{
+    zlog_info(cat, "[CTPTraderSpi::ReqInstruments] 开始发送合约查询请求");
+    CThostFtdcQryInstrumentField req;
+    memset(&req, 0, sizeof(CThostFtdcQryInstrumentField));
+    int ret = api->ReqQryInstrument(&req, requestid++);
+    zlog_info(cat, "[CTPTraderSpi::ReqInstruments] 发送请求合约=%d", ret);
+}
+
+void CTPTraderSpi::ReqInvestorPositions()
+{
+    CThostFtdcQryInvestorPositionField req;
+    memset(&req, 0, sizeof(CThostFtdcQryInvestorPositionField));
+    strncpy(req.BrokerID, brokerid.c_str(), sizeof(TThostFtdcBrokerIDType));
+    strncpy(req.InvestorID, userid.c_str(), sizeof(TThostFtdcInvestorIDType));
+    int ret = api->ReqQryInvestorPosition(&req, requestid++);
+    zlog_info(cat, "[CTPTraderSpi::ReqInvestorPositions] 发送请求持仓=%d", ret);
+}
+
+void CTPTraderSpi::ReqTradingAccount()
+{
+    CThostFtdcQryTradingAccountField req;
+    memset(&req, 0, sizeof(CThostFtdcQryTradingAccountField));
+    strncpy(req.BrokerID, brokerid.c_str(), sizeof(TThostFtdcBrokerIDType));
+    strncpy(req.InvestorID, userid.c_str(), sizeof(TThostFtdcInvestorIDType));
+    strncpy(req.CurrencyID, "CNY", sizeof(TThostFtdcCurrencyIDType));
+    int ret = api->ReqQryTradingAccount(&req, requestid++);
+    zlog_info(cat, "[CTPTraderSpi::ReqTradingAccount] 发送请求资金账户=%d, BrokerID=%s, InvestorID=%s", ret, brokerid.c_str(), userid.c_str());
+}
+
+void CTPTraderSpi::Destroy()
+{
+    zlog_info(cat, "[CTPTraderSpi::Destroy] .");
+    if (api)
+    {
+        api->Release();
+        api = nullptr;
+    }
+    zlog_info(cat, "[CTPTraderSpi::Destroy] api released.");
+    
+    // 清理ZMQ发布者
+    publisher.disconnect();
+    zlog_info(cat, "[CTPTraderSpi::Destroy] ZMQ publisher released.");
+    
+    // // 清理数据库管理器
+    // if (dbManager)
+    // {
+    //     delete dbManager;
+    //     dbManager = nullptr;
+    //     zlog_info(cat, "[CTPTraderSpi::Destroy] database manager released.");
+    // }
+}

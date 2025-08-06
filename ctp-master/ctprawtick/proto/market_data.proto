@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package ctp;
+
+// 市场数据消息
+message MarketDataMessage {
+    // 交易日
+    string trading_day = 1;
+    // 合约代码
+    string instrument_id = 2;
+    // 交易所代码
+    string exchange_id = 3;
+    // 合约在交易所的代码
+    string exchange_inst_id = 4;
+    // 最新价
+    double last_price = 5;
+    // 上次结算价
+    double pre_settlement_price = 6;
+    // 昨收盘
+    double pre_close_price = 7;
+    // 昨持仓量
+    double pre_open_interest = 8;
+    // 今开盘
+    double open_price = 9;
+    // 最高价
+    double highest_price = 10;
+    // 最低价
+    double lowest_price = 11;
+    // 数量
+    int32 volume = 12;
+    // 成交金额
+    double turnover = 13;
+    // 持仓量
+    double open_interest = 14;
+    // 今收盘
+    double close_price = 15;
+    // 本次结算价
+    double settlement_price = 16;
+    // 涨停板价
+    double upper_limit_price = 17;
+    // 跌停板价
+    double lower_limit_price = 18;
+    // 昨虚实度
+    double pre_delta = 19;
+    // 今虚实度
+    double curr_delta = 20;
+    // 最后修改时间
+    string update_time = 21;
+    // 最后修改毫秒
+    int32 update_millisec = 22;
+    // 申买价一
+    double bid_price1 = 23;
+    // 申买量一
+    int32 bid_volume1 = 24;
+    // 申卖价一
+    double ask_price1 = 25;
+    // 申卖量一
+    int32 ask_volume1 = 26;
+    // 申买价二
+    double bid_price2 = 27;
+    // 申买量二
+    int32 bid_volume2 = 28;
+    // 申卖价二
+    double ask_price2 = 29;
+    // 申卖量二
+    int32 ask_volume2 = 30;
+    // 申买价三
+    double bid_price3 = 31;
+    // 申买量三
+    int32 bid_volume3 = 32;
+    // 申卖价三
+    double ask_price3 = 33;
+    // 申卖量三
+    int32 ask_volume3 = 34;
+    // 申买价四
+    double bid_price4 = 35;
+    // 申买量四
+    int32 bid_volume4 = 36;
+    // 申卖价四
+    double ask_price4 = 37;
+    // 申卖量四
+    int32 ask_volume4 = 38;
+    // 申买价五
+    double bid_price5 = 39;
+    // 申买量五
+    int32 bid_volume5 = 40;
+    // 申卖价五
+    double ask_price5 = 41;
+    // 申卖量五
+    int32 ask_volume5 = 42;
+    // 当日均价
+    double average_price = 43;
+    // 业务日期
+    string action_day = 44;
+    // 本地时间戳
+    string local_timestamp = 45;
+    // 消息时间戳(毫秒)
+    int64 timestamp = 46;
+}
+
+// 批量市场数据消息
+message MarketDataBatchMessage {
+    repeated MarketDataMessage market_data = 1;
+    // 消息时间戳
+    int64 timestamp = 2;
+    // 消息类型
+    string message_type = 3;
+} 

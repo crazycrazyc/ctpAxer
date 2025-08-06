@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package ctp;
+
+// 投资者信息消息
+message InvestorMessage {
+    // 投资者代码
+    string investor_id = 1;
+    // 经纪公司代码
+    string broker_id = 2;
+    // 投资者分组代码
+    string investor_group_id = 3;
+    // 投资者名称
+    string investor_name = 4;
+    // 证件类型
+    string identified_card_type = 5;
+    // 证件号码
+    string identified_card_no = 6;
+    // 是否活跃
+    int32 is_active = 7;
+    // 联系电话
+    string telephone = 8;
+    // 通讯地址
+    string address = 9;
+    // 开户日期
+    string open_date = 10;
+    // 手机
+    string mobile = 11;
+    // 手续费率模板代码
+    string comm_model_id = 12;
+    // 保证金率模板代码
+    string margin_model_id = 13;
+}
+
+// 批量投资者消息
+message InvestorBatchMessage {
+    // 时间戳
+    int64 timestamp = 1;
+    // 消息类型
+    string message_type = 2;
+    // 投资者列表
+    repeated InvestorMessage investors = 3;
+} 
